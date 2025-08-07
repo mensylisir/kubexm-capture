@@ -1,0 +1,3 @@
+npm install
+npm run build
+kubectl create configmap kubexm-capture-plugin-files --from-file=package.json --from-file=main.js=./dist/main.js -n tcm
