@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mytcm
+  namespace: tcm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mytcm
+  template:
+    metadata:
+      labels:
+        app: mytcm
+    spec:
+      containers:
+        - args:
+            - -in-cluster
+            - -plugins-dir=/headlamp/plugins
+            - -oidc-client-id=kubernetes
+            - -oidc-idp-issuer-url=https://keycloak.kmpp.io/auth/realms/cars
+            - -oidc-client-secret=Veb85PHv1T85keyLhjDqKHOuU7maaZbx
+            - -insecure-ssl
+            - -proxy-urls=https://keycloak.kmpp.io/auth/*,http://172.30.1.52:8088/*,http://192.168.80.65:32314/*
+          image: registry.dev.rdev.tech:18093/headlamp/taichu_cluster:v0.23
+          imagePullPolicy: IfNotPresent
+          name: mytcm
+          ports:
+            - containerPort: 4466
+              protocol: TCP
+          resources: {}
+          volumeMounts:
+            - mountPath: /headlamp/frontend/config.js
+              name: tcm-cm
+              subPath: config.js
+            - mountPath: /headlamp/plugins/kubexm-terminals
+              name: kubexm-terminals-plugin-volume
+            - mountPath: /headlamp/plugins/kubexm-capture
+              name: kubexm-capture-plugin-volume
+      volumes:
+        - configMap:
+            defaultMode: 420
+            name: tcm-cm
+          name: tcm-cm
+        - configMap:
+            defaultMode: 420
+            name: kubexm-terminals-plugin-files
+          name: kubexm-terminals-plugin-volume
+        - configMap:
+            defaultMode: 420
+            name: kubexm-capture-plugin-files
+          name: kubexm-capture-plugin-volume
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mytcm-svc
+  namespace: tcm
+spec:
+  type: NodePort
+  selector:
+    app: mytcm
+  ports:
+    - protocol: TCP
+      port: 4466
+      targetPort: 4466
+      nodePort: 30446
