@@ -1,3 +1,6 @@
 npm install
 npm run build
 kubectl create configmap kubexm-capture-plugin-files --from-file=package.json --from-file=main.js=./dist/main.js -n tcm
+kubectl patch configmap kubexm-capture-plugin-files -n tcm \
+  --type=merge \
+  -p '{"metadata":{"labels":{"headlamp.dev/plugin":"kubexm-capture"},"annotations":{"headlamp.dev/proxy-service":"kubexm-capture-backend-svc.tcm"}}}'

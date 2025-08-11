@@ -50,6 +50,7 @@ export default function TcpdumpCapturePage() {
     const [isDsRunning, setIsDsRunning] = React.useState<boolean>(false);
     const [isLoading, setIsLoading] = React.useState<boolean>(true);
     const [error, setError] = React.useState<string | null>(null);
+    const [isDownloading, setIsDownloading] = React.useState<boolean>(false);
 
     const [captureFilter, setCaptureFilter] = React.useState(''); //tcp port 80 or tcp port 443
     const [captureImage, setCaptureImage] = React.useState('registry.dev.rdev.tech:18093/headlamp/super-netshoot:2.0');
@@ -138,6 +139,48 @@ export default function TcpdumpCapturePage() {
         } catch (err: any) {
             console.error("Failed to stop capture:", err);
             setError(`停止抓包失败: ${err.message || '未知错误'}`);
+            setIsLoading(false);
+        }
+    };
+
+
+    const handleStopAndDownload = async () => {
+        setIsDownloading(true);
+        setIsLoading(true);
+        setError(null);
+
+        try {
+            const downloadUrl = `/plugins/kubexm-capture/api/collect-and-download`;
+
+            const response = await fetch(ApiProxy.getUrl(downloadUrl), {
+                method: 'POST',
+                headers: {
+                    'Accept': 'application/vnd.tcpdump.pcap',
+                },
+            });
+
+            if (!response.ok) {
+                const errText = await response.text();
+                throw new Error(`下载失败 (状态 ${response.status}): ${errText}`);
+            }
+
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `cluster-capture-${new Date().toISOString()}.pcap`;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            window.URL.revokeObjectURL(url);
+
+            setTimeout(checkDaemonSetStatus, 2000);
+
+        } catch (err: any) {
+            console.error("Failed to download capture:", err);
+            setError(`下载抓包文件失败: ${err.message || '未知错误'}`);
+        } finally {
+            setIsDownloading(false);
             setIsLoading(false);
         }
     };
