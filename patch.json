@@ -1,0 +1,10 @@
+{
+  "metadata": {
+    "labels": {
+      "headlamp.dev/plugin": "kubexm-capture"
+    },
+    "annotations": {
+      "headlamp.dev/proxy-service": "kubexm-capture-backend-svc.tcm"
+    }
+  }
+}

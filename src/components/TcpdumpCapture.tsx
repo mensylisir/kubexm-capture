@@ -4,12 +4,16 @@ import {
     Table, TableBody, TableCell, TableContainer, TableHead, TableRow
 } from '@mui/material';
 import { ApiProxy } from '@kinvolk/headlamp-plugin/lib';
+import { K8s } from '@kinvolk/headlamp-plugin/lib';
 
 const DS_NAME = 'tcpdump-capture-ds';
 const DS_NAMESPACE = 'kubexm-capture';
 const DS_LABEL_SELECTOR = 'app=tcpdump-capture';
+const BACKEND_SERVICE_NAME = 'kubexm-capture-backend-svc';
+const BACKEND_SERVICE_NAMESPACE = 'tcm';
 
 function getTcpdumpDaemonSetSpec(filter: string, image: string) {
+    const pcapFilePath = `/captures/\${NODE_NAME}.pcap`;
     return {
         apiVersion: 'apps/v1',
         kind: 'DaemonSet',
@@ -31,6 +35,8 @@ function getTcpdumpDaemonSetSpec(filter: string, image: string) {
                         image: image,
                         command: ["/bin/sh", "-c"],
                         args: [
+                            `echo "Cleaning up old capture file: ${pcapFilePath}" && ` +
+                            `rm -f "${pcapFilePath}" && ` +
                             `echo 'Starting tcpdump on all interfaces (any) with filter: ${filter}' && tcpdump -i any -s0 -w "/captures/\${NODE_NAME}.pcap" '${filter}'`
                         ],
                         env: [{ name: 'NODE_NAME', valueFrom: { fieldRef: { fieldPath: 'spec.nodeName' } } }],
@@ -43,7 +49,8 @@ function getTcpdumpDaemonSetSpec(filter: string, image: string) {
     };
 }
 
-import { K8s } from '@kinvolk/headlamp-plugin/lib';
+type K8sService = InstanceType<typeof K8s.ResourceClasses.Service>;
+
 type K8sPod = InstanceType<typeof K8s.ResourceClasses.Pod>;
 
 export default function TcpdumpCapturePage() {
@@ -53,9 +60,10 @@ export default function TcpdumpCapturePage() {
     const [isDownloading, setIsDownloading] = React.useState<boolean>(false);
 
     const [captureFilter, setCaptureFilter] = React.useState(''); //tcp port 80 or tcp port 443
-    const [captureImage, setCaptureImage] = React.useState('registry.dev.rdev.tech:18093/headlamp/super-netshoot:2.0');
+    const [captureImage, setCaptureImage] = React.useState('registry.dev.rdev.tech:18093/headlamp/universal-toolkit:1.0');
 
     const [pods, setPods] = React.useState<K8sPod[]>([]);
+    const [progress, setProgress] = React.useState<string>('');
 
     const dsUrl = `/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets/${DS_NAME}`;
     const nsUrl = `/api/v1/namespaces/${DS_NAMESPACE}`;
@@ -64,21 +72,40 @@ export default function TcpdumpCapturePage() {
     const checkDaemonSetStatus = React.useCallback(async () => {
         setIsLoading(true);
         setError(null);
-        try {
-            await ApiProxy.request(dsUrl);
-            setIsDsRunning(true);
-            const podList = await ApiProxy.request(podsUrl);
-            setPods(podList.items || []);
-        } catch (err: any) {
-            if (err.status === 404) {
-                setIsDsRunning(false);
-                setPods([]);
-            } else {
-                console.error("Failed to check DaemonSet status:", err);
-                setError(`检查抓包工具状态失败: ${err.message || '未知错误'}`);
+
+        const maxRetries = 3;
+        const retryDelay = 2000;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await ApiProxy.request(dsUrl);
+                setIsDsRunning(true);
+
+                const podsUrlWithCacheBust = `${podsUrl}&t=${new Date().getTime()}`;
+                const podListResponse = await ApiProxy.request(podsUrlWithCacheBust);
+                setPods(podListResponse.items || []);
+
+                setIsLoading(false);
+                return;
+
+            } catch (err: any) {
+                if (err.status === 404) {
+                    setIsDsRunning(false);
+                    setPods([]);
+                    setIsLoading(false);
+                    return;
+                }
+
+                if (attempt < maxRetries) {
+                    console.warn(`Attempt ${attempt} failed, retrying in ${retryDelay / 1000}s...`, err);
+                    await new Promise(resolve => setTimeout(resolve, retryDelay));
+                } else {
+                    console.error("Failed to check DaemonSet status after multiple retries:", err);
+                    setError(`检查抓包工具状态失败: ${err.message || 'Unreachable'}`);
+                    setIsLoading(false);
+                    return;
+                }
             }
-        } finally {
-            setIsLoading(false);
         }
     }, [dsUrl, podsUrl]);
 
@@ -143,47 +170,98 @@ export default function TcpdumpCapturePage() {
         }
     };
 
+    const getBackendNodePort = React.useCallback(async (): Promise<number> => {
+        try {
+            const service = await K8s.ResourceClasses.Service.apiGet({
+                name: BACKEND_SERVICE_NAME,
+                namespace: BACKEND_SERVICE_NAMESPACE,
+            });
+
+            if (!service || !service.spec || !service.spec.ports || service.spec.ports.length === 0) {
+                throw new Error(`Service "${BACKEND_SERVICE_NAME}" has no spec.ports defined.`);
+            }
+
+            const portInfo = service.spec.ports[0];
+            if (portInfo && portInfo.nodePort) {
+                console.log(`Successfully fetched NodePort: ${portInfo.nodePort}`);
+                return portInfo.nodePort;
+            }
+
+            throw new Error(`Service "${BACKEND_SERVICE_NAME}" found, but it has no nodePort defined.`);
+        } catch (err) {
+            console.error(`Failed to get backend NodePort service: ${err}`);
+            throw new Error(`无法获取后端服务端口: ${err.message || '未知错误'}`);
+        }
+    }, []);
 
     const handleStopAndDownload = async () => {
         setIsDownloading(true);
-        setIsLoading(true);
         setError(null);
+        setProgress('正在连接后端...');
 
-        try {
-            const downloadUrl = `/plugins/kubexm-capture/api/collect-and-download`;
+        const nodeHost = window.location.hostname;
+        const nodePort = 31138;
+        const wsUrl = `ws://${nodeHost}:${nodePort}/ws`;
 
-            const response = await fetch(ApiProxy.getUrl(downloadUrl), {
-                method: 'POST',
-                headers: {
-                    'Accept': 'application/vnd.tcpdump.pcap',
-                },
-            });
+        const ws = new WebSocket(wsUrl);
 
-            if (!response.ok) {
-                const errText = await response.text();
-                throw new Error(`下载失败 (状态 ${response.status}): ${errText}`);
+        ws.onopen = () => {
+
+            setProgress('连接成功，正在发送任务...');
+            const taskID = "task-" + Date.now();
+
+            const podsToCollect = pods.map(pod => ({
+                name: pod.metadata.name,
+                nodeName: pod.spec.nodeName,
+            }));
+
+            ws.send(JSON.stringify({
+                taskID: taskID,
+                podsToCollect: podsToCollect,
+            }));
+        };
+
+        ws.onmessage = (event) => {
+            const update = JSON.parse(event.data);
+
+            setProgress(update.message);
+
+            if (update.status === 'complete') {
+                setProgress('任务完成，正在触发下载...');
+                const downloadUrl = `http://${nodeHost}:${nodePort}${update.url}`;
+                const a = document.createElement('a');
+                a.href = downloadUrl;
+                a.download = `cluster-capture-${new Date().toISOString()}.pcap`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+
+                ws.close();
+                setIsDownloading(false);
+                setTimeout(checkDaemonSetStatus, 2000);
             }
 
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `cluster-capture-${new Date().toISOString()}.pcap`;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            window.URL.revokeObjectURL(url);
+            if (update.status === 'error') {
+                setError(`后端任务失败: ${update.message}`);
+                ws.close();
+                setIsDownloading(false);
+            }
+        };
 
-            setTimeout(checkDaemonSetStatus, 2000);
-
-        } catch (err: any) {
-            console.error("Failed to download capture:", err);
-            setError(`下载抓包文件失败: ${err.message || '未知错误'}`);
-        } finally {
+        ws.onerror = (event) => {
+            setError('WebSocket 连接错误');
+            console.error('WebSocket error:', event);
             setIsDownloading(false);
-            setIsLoading(false);
-        }
+        };
+
+        ws.onclose = () => {
+            console.log('WebSocket 连接已关闭');
+            if (!error && progress !== '任务完成，正在触发下载...') {
+                setIsDownloading(false);
+            }
+        };
     };
+
 
     return (
         <Paper sx={{ m: 2, p: 3 }}>
@@ -191,6 +269,15 @@ export default function TcpdumpCapturePage() {
                 集群网络抓包工具
             </Typography>
             {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+
+            {isDownloading && progress &&
+                <Alert severity="info" sx={{ mb: 2 }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                        <CircularProgress size={20} sx={{ mr: 2 }} />
+                        <Typography>{progress}</Typography>
+                    </Box>
+                </Alert>
+            }
 
             <Box sx={{ p: 2, border: '1px solid', borderColor: 'divider', borderRadius: 1, mb: 4 }}>
                 <Typography variant="h6" gutterBottom>控制面板</Typography>
@@ -215,15 +302,39 @@ export default function TcpdumpCapturePage() {
                             disabled={isDsRunning || isLoading}
                             sx={{ flexGrow: 1, minWidth: '300px' }}
                         />
-                        <Button
-                            variant="contained"
-                            color={isDsRunning ? "error" : "primary"}
-                            onClick={isDsRunning ? handleStopCapture : handleStartCapture}
-                            disabled={isLoading}
-                            startIcon={isLoading && <CircularProgress size={20} color="inherit" />}
-                        >
-                            {isLoading ? (isDsRunning ? '正在停止...' : '正在启动...') : (isDsRunning ? '停止抓包' : '开始抓包')}
-                        </Button>
+
+                        {!isDsRunning ? (
+                            <Button
+                                variant="contained"
+                                color="primary"
+                                onClick={handleStartCapture}
+                                disabled={isLoading}
+                                startIcon={isLoading && <CircularProgress size={20} color="inherit" />}
+                            >
+                                {isLoading ? '正在启动...' : '开始抓包'}
+                            </Button>
+                        ) : (
+                            <>
+                                <Button
+                                    variant="contained"
+                                    color="secondary"
+                                    onClick={handleStopAndDownload}
+                                    disabled={isLoading}
+                                    startIcon={isDownloading && <CircularProgress size={20} color="inherit" />}
+                                >
+                                    {isDownloading ? '正在处理...' : '停止并下载'}
+                                </Button>
+                                <Button
+                                    variant="outlined"
+                                    color="error"
+                                    onClick={handleStopCapture}
+                                    disabled={isLoading}
+                                    startIcon={isLoading && !isDownloading && <CircularProgress size={20} color="inherit" />}
+                                >
+                                    {isLoading && !isDownloading ? '正在停止...' : '仅停止 (不下载)'}
+                                </Button>
+                            </>
+                        )}
                     </Box>
                 </Box>
             </Box>
@@ -244,12 +355,7 @@ export default function TcpdumpCapturePage() {
                             </Alert>
                             <Typography variant="subtitle1" gutterBottom>抓包文件说明</Typography>
                             <Alert severity="info" sx={{ mb: 2 }}>
-                                抓包文件 (.pcap) 被保存在 **每个节点** 的 <strong>/tmp/captures/</strong> 目录下。
-                                <br />
-                                文件名格式为: <strong>[节点名称].pcap</strong>。
-                                <br />
-                                您需要通过 SSH 或 `kubectl cp` 登录到相应节点以获取文件。
-                                例如: `kubectl cp {DS_NAMESPACE}/[Pod名称] /captures/[节点名称].pcap ./[节点名称].pcap`
+                                新功能: 点击 "停止并下载" 按钮会自动收集所有节点的抓包文件，合并后提供下载，并清理抓包环境。
                             </Alert>
                             <Typography variant="subtitle1" gutterBottom>抓包 Pod 状态</Typography>
                             <TableContainer component={Paper} variant="outlined">

@@ -1,5 +1,5 @@
 #!/bin/bash
-NAMESPACE="kubexm-system"
+NAMESPACE="kubexm-capture"
 LABEL="app=tcpdump-capture"
 
 echo "Fetching capture files from all nodes..."

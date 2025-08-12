@@ -1,5 +1,5 @@
 {
-  "name": "kubexm网络抓包",
+  "name": "kubexm-capture",
   "version": "0.0.6",
   "description": "kubexm抓包程序作为headlamp插件提供",
   "scripts": {
