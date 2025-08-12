@@ -76,6 +76,7 @@ function getCleanupDaemonSetSpec(image: string) {
                             mountPath: '/host/tmp',
                         }],
                     }],
+                    restartPolicy: "OnFailure",
                     volumes: [{
                         name: 'host-tmp',
                         hostPath: { path: '/tmp' },
@@ -260,22 +261,58 @@ export default function TcpdumpCapturePage() {
 
         const cleanupFiles = async () => {
             setProgress('正在清理节点上的残留文件...');
-            try {
-                const cleanupDsSpec = getCleanupDaemonSetSpec(captureImage);
-                const cleanupDsUrl = `/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets/${CLEANUP_DS_NAME}`;
+            const cleanupDsSpec = getCleanupDaemonSetSpec();
+            const cleanupDsUrl = `/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets/${CLEANUP_DS_NAME}`;
+            const cleanupPodsUrl = `/api/v1/namespaces/${DS_NAMESPACE}/pods?labelSelector=app=pcap-cleanup`;
 
+            try {
                 await ApiProxy.post(`/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets`, cleanupDsSpec);
                 console.log('Cleanup DaemonSet created.');
 
-                setTimeout(async () => {
+                setProgress('清理任务已启动，等待各节点执行...');
+                const checkInterval = 3000;
+                const timeout = 60000;
+                const startTime = Date.now();
+
+                const waitForCleanup = async (): Promise<void> => {
+                    if (Date.now() - startTime > timeout) {
+                        throw new Error('清理任务超时。');
+                    }
+
+                    const dsStatus = await ApiProxy.request(cleanupDsUrl);
+                    const desired = dsStatus.status.desiredNumberScheduled;
+                    const updated = dsStatus.status.updatedNumberScheduled;
+                    const available = dsStatus.status.numberAvailable;
+
+                    setProgress(`清理进度: ${available || 0} / ${desired || '?'} 个节点已完成`);
+
+                    if (desired > 0 && desired === updated && desired === available) {
+                        console.log('Cleanup seems complete.');
+                        return;
+                    }
+
+                    await new Promise(resolve => setTimeout(resolve, checkInterval));
+                    await waitForCleanup();
+                };
+
+                await waitForCleanup();
+
+            } catch (err: any) {
+                console.error('Failed during cleanup process:', err);
+            } finally {
+                try {
                     await ApiProxy.delete(cleanupDsUrl);
                     console.log('Cleanup DaemonSet deleted.');
                     setProgress('清理完成！');
-                }, 5000);
-
-            } catch (err: any) {
-                console.error('Failed to run cleanup job:', err);
-                setProgress('文件已下载，但自动清理失败。');
+                } catch (deleteErr: any) {
+                    if (deleteErr.status !== 404) {
+                        console.error('Failed to delete cleanup DaemonSet:', deleteErr);
+                        setProgress('文件已下载，但自动清理DS失败。');
+                    } else {
+                        console.log('Cleanup DaemonSet already gone.');
+                        setProgress('清理完成！');
+                    }
+                }
             }
         };
 
