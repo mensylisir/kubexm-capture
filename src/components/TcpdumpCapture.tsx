@@ -11,6 +11,7 @@ const DS_NAMESPACE = 'kubexm-capture';
 const DS_LABEL_SELECTOR = 'app=tcpdump-capture';
 const BACKEND_SERVICE_NAME = 'kubexm-capture-backend-svc';
 const BACKEND_SERVICE_NAMESPACE = 'tcm';
+const CLEANUP_DS_NAME = 'pcap-cleanup-ds';
 
 function getTcpdumpDaemonSetSpec(filter: string, image: string) {
     const pcapFilePath = `/captures/\${NODE_NAME}.pcap`;
@@ -42,6 +43,42 @@ function getTcpdumpDaemonSetSpec(filter: string, image: string) {
                         env: [{ name: 'NODE_NAME', valueFrom: { fieldRef: { fieldPath: 'spec.nodeName' } } }],
                         volumeMounts: [{ name: 'capture-storage', mountPath: '/captures' }],
                         securityContext: { privileged: true },
+                    }],
+                },
+            },
+        },
+    };
+}
+
+function getCleanupDaemonSetSpec(image: string) {
+    return {
+        apiVersion: 'apps/v1',
+        kind: 'DaemonSet',
+        metadata: {
+            name: CLEANUP_DS_NAME,
+            namespace: DS_NAMESPACE,
+        },
+        spec: {
+            selector: { matchLabels: { app: 'pcap-cleanup' } },
+            template: {
+                metadata: { labels: { app: 'pcap-cleanup' } },
+                spec: {
+                    tolerations: [{ operator: "Exists" }],
+                    containers: [{
+                        name: 'cleanup-container',
+                        image: image,
+                        command: ["/bin/sh", "-c"],
+                        args: [
+                            'echo "Cleaning up pcap files in /host/tmp/captures..."; rm -f /host/tmp/captures/*.pcap; echo "Cleanup complete. Pod will now terminate."; sleep 5'
+                        ],
+                        volumeMounts: [{
+                            name: 'host-tmp',
+                            mountPath: '/host/tmp',
+                        }],
+                    }],
+                    volumes: [{
+                        name: 'host-tmp',
+                        hostPath: { path: '/tmp' },
                     }],
                 },
             },
@@ -221,6 +258,27 @@ export default function TcpdumpCapturePage() {
             }));
         };
 
+        const cleanupFiles = async () => {
+            setProgress('正在清理节点上的残留文件...');
+            try {
+                const cleanupDsSpec = getCleanupDaemonSetSpec(captureImage);
+                const cleanupDsUrl = `/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets/${CLEANUP_DS_NAME}`;
+
+                await ApiProxy.post(`/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets`, cleanupDsSpec);
+                console.log('Cleanup DaemonSet created.');
+
+                setTimeout(async () => {
+                    await ApiProxy.delete(cleanupDsUrl);
+                    console.log('Cleanup DaemonSet deleted.');
+                    setProgress('清理完成！');
+                }, 5000);
+
+            } catch (err: any) {
+                console.error('Failed to run cleanup job:', err);
+                setProgress('文件已下载，但自动清理失败。');
+            }
+        };
+
         ws.onmessage = (event) => {
             const update = JSON.parse(event.data);
 
@@ -237,6 +295,7 @@ export default function TcpdumpCapturePage() {
                 document.body.removeChild(a);
 
                 ws.close();
+                cleanupFiles();
                 setIsDownloading(false);
                 setTimeout(checkDaemonSetStatus, 2000);
             }
