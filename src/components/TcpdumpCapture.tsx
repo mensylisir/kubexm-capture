@@ -21,6 +21,7 @@ function getTcpdumpDaemonSetSpec(filter: string, image: string) {
         metadata: { name: DS_NAME, namespace: DS_NAMESPACE },
         spec: {
             selector: { matchLabels: { app: 'tcpdump-capture' } },
+            terminationGracePeriodSeconds: 60,
             template: {
                 metadata: { labels: { app: 'tcpdump-capture' } },
                 spec: {
@@ -36,9 +37,18 @@ function getTcpdumpDaemonSetSpec(filter: string, image: string) {
                         image: image,
                         command: ["/bin/sh", "-c"],
                         args: [
-                            `echo "Cleaning up old capture file: ${pcapFilePath}" && ` +
-                            `rm -f "${pcapFilePath}" && ` +
-                            `echo 'Starting tcpdump on all interfaces (any) with filter: ${filter}' && tcpdump -i any -s0 -w "/captures/\${NODE_NAME}.pcap" '${filter}'`
+                            `set -e; ` +
+                            `echo "--- Capture Pod Initializing ---"; ` +
+                            `echo "Checking for old file at ${pcapFilePath}..."; ` +
+                            `if [ -f "${pcapFilePath}" ]; then ` +
+                            `  echo "Old file found. Size: $(ls -lh "${pcapFilePath}" | awk '{print $5}')"; ` +
+                            `  echo "Attempting to remove old file..."; ` +
+                            `  rm -f "${pcapFilePath}"; ` +
+                            `  if [ $? -eq 0 ]; then echo "Old file successfully removed."; else echo "ERROR: Failed to remove old file!"; exit 1; fi; ` +
+                            `else ` +
+                            `  echo "No old file found. Proceeding."; ` +
+                            `fi; ` +
+                            `echo 'Starting tcpdump on all interfaces (any) with filter: ${filter}' && tcpdump -i any -s0 -w "/captures/\${NODE_NAME}.pcap" '${filter}';`
                         ],
                         env: [{ name: 'NODE_NAME', valueFrom: { fieldRef: { fieldPath: 'spec.nodeName' } } }],
                         volumeMounts: [{ name: 'capture-storage', mountPath: '/captures' }],
@@ -76,7 +86,6 @@ function getCleanupDaemonSetSpec(image: string) {
                             mountPath: '/host/tmp',
                         }],
                     }],
-                    restartPolicy: "OnFailure",
                     volumes: [{
                         name: 'host-tmp',
                         hostPath: { path: '/tmp' },
@@ -261,7 +270,7 @@ export default function TcpdumpCapturePage() {
 
         const cleanupFiles = async () => {
             setProgress('正在清理节点上的残留文件...');
-            const cleanupDsSpec = getCleanupDaemonSetSpec();
+            const cleanupDsSpec = getCleanupDaemonSetSpec(captureImage);
             const cleanupDsUrl = `/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets/${CLEANUP_DS_NAME}`;
             const cleanupPodsUrl = `/api/v1/namespaces/${DS_NAMESPACE}/pods?labelSelector=app=pcap-cleanup`;
 
@@ -314,6 +323,25 @@ export default function TcpdumpCapturePage() {
                     }
                 }
             }
+
+            try {
+                await new Promise(resolve => setTimeout(resolve, 5000));
+                console.log('Attempting to delete cleanup DaemonSet...');
+                await ApiProxy.delete(cleanupDsUrl);
+                console.log('Cleanup DaemonSet deleted.');
+                setProgress('清理完成！');
+            } catch (deleteErr: any) {
+                if (deleteErr.status !== 404) {
+                    console.error('Failed to delete cleanup DaemonSet:', deleteErr);
+                    setProgress('文件已下载，但自动清理DS失败。');
+                } else {
+                    console.log('Cleanup DaemonSet already gone.');
+                    setProgress('清理完成！');
+                }
+            }
+            finally {
+                setProgress('清理完成！');
+            }
         };
 
         ws.onmessage = (event) => {
@@ -352,6 +380,7 @@ export default function TcpdumpCapturePage() {
 
         ws.onclose = () => {
             console.log('WebSocket 连接已关闭');
+            cleanupFiles();
             if (!error && progress !== '任务完成，正在触发下载...') {
                 setIsDownloading(false);
             }
@@ -451,7 +480,7 @@ export default function TcpdumpCapturePage() {
                             </Alert>
                             <Typography variant="subtitle1" gutterBottom>抓包文件说明</Typography>
                             <Alert severity="info" sx={{ mb: 2 }}>
-                                新功能: 点击 "停止并下载" 按钮会自动收集所有节点的抓包文件，合并后提供下载，并清理抓包环境。
+                                点击 "停止并下载" 按钮会自动收集所有节点的抓包文件，合并后提供下载，并清理抓包环境。
                             </Alert>
                             <Typography variant="subtitle1" gutterBottom>抓包 Pod 状态</Typography>
                             <TableContainer component={Paper} variant="outlined">
