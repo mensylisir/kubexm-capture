@@ -1,10 +1,12 @@
 import React from 'react';
 import {
     Box, Button, CircularProgress, Paper, TextField, Typography, Alert,
-    Table, TableBody, TableCell, TableContainer, TableHead, TableRow
+    Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TablePagination
 } from '@mui/material';
 import { ApiProxy } from '@kinvolk/headlamp-plugin/lib';
 import { K8s } from '@kinvolk/headlamp-plugin/lib';
+import { ApiProxy as HeadlampApiProxy } from '@kinvolk/headlamp-plugin/lib';
+const { post, request, delete: apiDelete } = HeadlampApiProxy;
 
 const DS_NAME = 'tcpdump-capture-ds';
 const DS_NAMESPACE = 'kubexm-capture';
@@ -79,7 +81,10 @@ function getCleanupDaemonSetSpec(image: string) {
                         image: image,
                         command: ["/bin/sh", "-c"],
                         args: [
-                            'echo "Cleaning up pcap files in /host/tmp/captures..."; rm -f /host/tmp/captures/*.pcap; echo "Cleanup complete. Pod will now terminate."; sleep 5'
+                            'echo "Cleaning up pcap files in /host/tmp/captures..."; ' +
+                            'find /host/tmp/captures -name "*.pcap" -type f -delete || true; ' +
+                            'echo "Cleanup complete. Pod will now terminate."; ' +
+                            'sleep 5'
                         ],
                         volumeMounts: [{
                             name: 'host-tmp',
@@ -112,6 +117,9 @@ export default function TcpdumpCapturePage() {
     const [pods, setPods] = React.useState<K8sPod[]>([]);
     const [progress, setProgress] = React.useState<string>('');
 
+    const [page, setPage] = React.useState(0);
+    const [rowsPerPage, setRowsPerPage] = React.useState(10);
+
     const dsUrl = `/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets/${DS_NAME}`;
     const nsUrl = `/api/v1/namespaces/${DS_NAMESPACE}`;
     const podsUrl = `/api/v1/namespaces/${DS_NAMESPACE}/pods?labelSelector=${DS_LABEL_SELECTOR}`;
@@ -119,6 +127,7 @@ export default function TcpdumpCapturePage() {
     const checkDaemonSetStatus = React.useCallback(async () => {
         setIsLoading(true);
         setError(null);
+
 
         const maxRetries = 3;
         const retryDelay = 2000;
@@ -188,7 +197,9 @@ export default function TcpdumpCapturePage() {
     const handleStartCapture = async () => {
         setIsLoading(true);
         setError(null);
+
         try {
+            await handleCleanResources();
             await ensureNamespaceExists();
             const dsSpec = getTcpdumpDaemonSetSpec(captureFilter, captureImage);
             await ApiProxy.request(`/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets`, {
@@ -204,18 +215,21 @@ export default function TcpdumpCapturePage() {
         }
     };
 
-    const handleStopCapture = async () => {
+    const handleCleanResources = async () => {
+        const cleanupDsUrl = `/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets/${CLEANUP_DS_NAME}`;
         setIsLoading(true);
         setError(null);
         try {
-            await ApiProxy.request(dsUrl, { method: 'DELETE' });
-            setTimeout(checkDaemonSetStatus, 2000);
-        } catch (err: any) {
-            console.error("Failed to stop capture:", err);
-            setError(`停止抓包失败: ${err.message || '未知错误'}`);
-            setIsLoading(false);
+            await ApiProxy.request(cleanupDsUrl);
+            console.log("发现旧的 cleanup DaemonSet，正在删除...");
+            await apiDelete(cleanupDsUrl)
+        } catch (err: any){
+            if (err.status !== 404) {
+                console.error("检查或删除旧的 cleanup DS 时出错:", err);
+            }
         }
     };
+
 
     const getBackendNodePort = React.useCallback(async (): Promise<number> => {
         try {
@@ -241,17 +255,123 @@ export default function TcpdumpCapturePage() {
         }
     }, []);
 
+    const cleanupFiles = async () => {
+        setProgress('正在清理节点上的残留文件...');
+        const cleanupDsSpec = getCleanupDaemonSetSpec(captureImage);
+        const cleanupDsUrl = `/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets/${CLEANUP_DS_NAME}`;
+
+        try {
+            try {
+                await ApiProxy.request(cleanupDsUrl);
+                console.log("发现旧的 cleanup DaemonSet，正在删除...");
+                await apiDelete(cleanupDsUrl)
+            } catch (err: any){
+                if (err.status !== 404) {
+                    console.error("检查或删除旧的 cleanup DS 时出错:", err);
+                }
+            }
+
+            await post(`/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets`, cleanupDsSpec);
+            console.log('Cleanup DaemonSet created.');
+
+            setProgress('清理任务已启动，等待完成...');
+            const timeout = 120000;
+            const checkInterval = 5000;
+            const startTime = Date.now();
+
+            while (Date.now() - startTime < timeout) {
+                try {
+                    const dsStatus = await request(cleanupDsUrl);
+                    const desired = dsStatus.status.desiredNumberScheduled;
+                    const available = dsStatus.status.numberAvailable;
+                    // setProgress(`清理进度: ${available || 0} / ${desired || '?'} 个节点已完成`);
+                    if (desired > 0 && desired === available) {
+                        console.log('Cleanup seems complete.');
+                        break;
+                    }
+                } catch (e) {
+                    if (e.status === 404) {
+                        console.log('Cleanup DS not found, assuming complete.');
+                        break;
+                    }
+                }
+                await new Promise(resolve => setTimeout(resolve, checkInterval));
+            }
+        } catch (err: any) {
+            console.error('清理文件过程中出错:', err);
+            setError(`清理节点文件失败: ${err.message}`);
+        } finally {
+            const delay = 120000; // 2 minutes in milliseconds
+            console.log(`等待 ${delay / 1000} 秒后开始清理 cleanup DaemonSet...`);
+            setProgress(`等待 ${delay / 1000} 秒后清理临时资源...`);
+
+            setTimeout(async () => {
+                try {
+                    await ApiProxy.request(cleanupDsUrl, { method: 'DELETE' });
+                    console.log('Cleanup DaemonSet deleted after delay.');
+                    setProgress('临时资源清理完成！');
+                } catch (deleteErr: any) {
+                    if (deleteErr.status !== 404) {
+                        console.error('延时后删除清理DS失败:', deleteErr);
+                        setProgress('临时资源清理失败，请手动检查。');
+                    }
+                }
+            }, delay);
+        }
+    };
+
+    const handleFullCleanup = async (action: 'stop' | 'download') => {
+        if (action === 'download') {
+            setIsDownloading(true);
+        } else {
+            setIsLoading(true);
+        }
+        setError(null);
+        setProgress('开始停止抓包...');
+
+        try {
+            await ApiProxy.request(dsUrl, { method: 'DELETE' });
+            setProgress('抓包工具已停止，正在清理文件...');
+
+            await cleanupFiles();
+
+            setProgress('所有清理工作已完成！');
+        } catch (err: any) {
+            if (err.status !== 404) {
+                console.error("停止和清理过程中出错:", err);
+                setError(`操作失败: ${err.message || '未知错误'}`);
+            } else {
+                await cleanupFiles();
+                setProgress('所有清理工作已完成！');
+            }
+        } finally {
+            setTimeout(() => {
+                checkDaemonSetStatus();
+                setIsDownloading(false);
+                setProgress('');
+            }, 2000);
+        }
+    };
+
     const handleStopAndDownload = async () => {
         setIsDownloading(true);
         setError(null);
-        setProgress('正在连接后端...');
+        setProgress('正在清理旧资源...');
+
+        try {
+            await handleCleanResources();
+        } catch (err) {
+            setError(`清理旧资源失败: ${err.message}`);
+            setIsDownloading(false);
+            setProgress('');
+            return;
+        }
 
         const nodeHost = window.location.hostname;
         const nodePort = 31138;
         const wsUrl = `ws://${nodeHost}:${nodePort}/ws`;
 
         const ws = new WebSocket(wsUrl);
-
         ws.onopen = () => {
 
             setProgress('连接成功，正在发送任务...');
@@ -264,89 +384,13 @@ export default function TcpdumpCapturePage() {
 
             ws.send(JSON.stringify({
                 taskID: taskID,
+                daemonSetName: DS_NAME,
                 podsToCollect: podsToCollect,
             }));
         };
 
-        const cleanupFiles = async () => {
-            setProgress('正在清理节点上的残留文件...');
-            const cleanupDsSpec = getCleanupDaemonSetSpec(captureImage);
-            const cleanupDsUrl = `/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets/${CLEANUP_DS_NAME}`;
-            const cleanupPodsUrl = `/api/v1/namespaces/${DS_NAMESPACE}/pods?labelSelector=app=pcap-cleanup`;
-
-            try {
-                await ApiProxy.post(`/apis/apps/v1/namespaces/${DS_NAMESPACE}/daemonsets`, cleanupDsSpec);
-                console.log('Cleanup DaemonSet created.');
-
-                setProgress('清理任务已启动，等待各节点执行...');
-                const checkInterval = 3000;
-                const timeout = 60000;
-                const startTime = Date.now();
-
-                const waitForCleanup = async (): Promise<void> => {
-                    if (Date.now() - startTime > timeout) {
-                        throw new Error('清理任务超时。');
-                    }
-
-                    const dsStatus = await ApiProxy.request(cleanupDsUrl);
-                    const desired = dsStatus.status.desiredNumberScheduled;
-                    const updated = dsStatus.status.updatedNumberScheduled;
-                    const available = dsStatus.status.numberAvailable;
-
-                    setProgress(`清理进度: ${available || 0} / ${desired || '?'} 个节点已完成`);
-
-                    if (desired > 0 && desired === updated && desired === available) {
-                        console.log('Cleanup seems complete.');
-                        return;
-                    }
-
-                    await new Promise(resolve => setTimeout(resolve, checkInterval));
-                    await waitForCleanup();
-                };
-
-                await waitForCleanup();
-
-            } catch (err: any) {
-                console.error('Failed during cleanup process:', err);
-            } finally {
-                try {
-                    await ApiProxy.delete(cleanupDsUrl);
-                    console.log('Cleanup DaemonSet deleted.');
-                    setProgress('清理完成！');
-                } catch (deleteErr: any) {
-                    if (deleteErr.status !== 404) {
-                        console.error('Failed to delete cleanup DaemonSet:', deleteErr);
-                        setProgress('文件已下载，但自动清理DS失败。');
-                    } else {
-                        console.log('Cleanup DaemonSet already gone.');
-                        setProgress('清理完成！');
-                    }
-                }
-            }
-
-            try {
-                await new Promise(resolve => setTimeout(resolve, 5000));
-                console.log('Attempting to delete cleanup DaemonSet...');
-                await ApiProxy.delete(cleanupDsUrl);
-                console.log('Cleanup DaemonSet deleted.');
-                setProgress('清理完成！');
-            } catch (deleteErr: any) {
-                if (deleteErr.status !== 404) {
-                    console.error('Failed to delete cleanup DaemonSet:', deleteErr);
-                    setProgress('文件已下载，但自动清理DS失败。');
-                } else {
-                    console.log('Cleanup DaemonSet already gone.');
-                    setProgress('清理完成！');
-                }
-            }
-            finally {
-                setProgress('清理完成！');
-            }
-        };
-
         ws.onmessage = (event) => {
             const update = JSON.parse(event.data);
-
             setProgress(update.message);
 
             if (update.status === 'complete') {
@@ -358,35 +402,38 @@ export default function TcpdumpCapturePage() {
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
-
                 ws.close();
-                cleanupFiles();
-                setIsDownloading(false);
-                setTimeout(checkDaemonSetStatus, 2000);
             }
 
             if (update.status === 'error') {
                 setError(`后端任务失败: ${update.message}`);
                 ws.close();
-                setIsDownloading(false);
             }
         };
 
         ws.onerror = (event) => {
             setError('WebSocket 连接错误');
             console.error('WebSocket error:', event);
-            setIsDownloading(false);
         };
 
         ws.onclose = () => {
             console.log('WebSocket 连接已关闭');
-            cleanupFiles();
-            if (!error && progress !== '任务完成，正在触发下载...') {
+            cleanupFiles().finally(() => {
                 setIsDownloading(false);
-            }
+                setTimeout(checkDaemonSetStatus, 3000);
+            });
+
         };
     };
 
+    const handleChangePage = (event: unknown, newPage: number) => {
+        setPage(newPage);
+    };
+
+    const handleChangeRowsPerPage = (event: React.ChangeEvent<HTMLInputElement>) => {
+        setRowsPerPage(parseInt(event.target.value, 10));
+        setPage(0);
+    };
 
     return (
         <Paper sx={{ m: 2, p: 3 }}>
@@ -452,7 +499,8 @@ export default function TcpdumpCapturePage() {
                                 <Button
                                     variant="outlined"
                                     color="error"
-                                    onClick={handleStopCapture}
+                                    // onClick={handleStopCapture}
+                                    onClick={() => handleFullCleanup('stop')}
                                     disabled={isLoading}
                                     startIcon={isLoading && !isDownloading && <CircularProgress size={20} color="inherit" />}
                                 >
@@ -483,26 +531,40 @@ export default function TcpdumpCapturePage() {
                                 点击 "停止并下载" 按钮会自动收集所有节点的抓包文件，合并后提供下载，并清理抓包环境。
                             </Alert>
                             <Typography variant="subtitle1" gutterBottom>抓包 Pod 状态</Typography>
-                            <TableContainer component={Paper} variant="outlined">
-                                <Table size="small">
-                                    <TableHead>
-                                        <TableRow>
-                                            <TableCell>Pod 名称</TableCell>
-                                            <TableCell>所在节点</TableCell>
-                                            <TableCell>状态</TableCell>
-                                        </TableRow>
-                                    </TableHead>
-                                    <TableBody>
-                                        {pods.map(pod => (
-                                            <TableRow key={pod.metadata.uid}>
-                                                <TableCell>{pod.metadata.name}</TableCell>
-                                                <TableCell>{pod.spec.nodeName}</TableCell>
-                                                <TableCell>{pod.status.phase}</TableCell>
+                            <Paper variant="outlined">
+                                <TableContainer>
+                                    <Table size="small">
+                                        <TableHead>
+                                            <TableRow>
+                                                <TableCell>Pod 名称</TableCell>
+                                                <TableCell>所在节点</TableCell>
+                                                <TableCell>状态</TableCell>
                                             </TableRow>
-                                        ))}
-                                    </TableBody>
-                                </Table>
-                            </TableContainer>
+                                        </TableHead>
+                                        <TableBody>
+                                            {pods
+                                                .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+                                                .map(pod => (
+                                                    <TableRow key={pod.metadata.uid}>
+                                                        <TableCell>{pod.metadata.name}</TableCell>
+                                                        <TableCell>{pod.spec.nodeName}</TableCell>
+                                                        <TableCell>{pod.status.phase}</TableCell>
+                                                    </TableRow>
+                                                ))}
+                                        </TableBody>
+                                    </Table>
+                                </TableContainer>
+
+                                <TablePagination
+                                    rowsPerPageOptions={[5, 10, 25, { label: 'All', value: -1 }]}
+                                    component="div"
+                                    count={pods.length}
+                                    rowsPerPage={rowsPerPage}
+                                    page={page}
+                                    onPageChange={handleChangePage}
+                                    onRowsPerPageChange={handleChangeRowsPerPage}
+                                />
+                            </Paper>
                         </>
                     ) : (
                         <Alert severity="info">
